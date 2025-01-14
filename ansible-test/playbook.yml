@@ -1,0 +1,51 @@
+- name: Run Celestia setup script
+  hosts: localhost
+  become: yes
+  vars:
+    go_version: "1.23.0"
+    celestia_node_name: "celestia-node"
+    wallet_name: "wallet"
+    wallet_password: "your_secure_password"
+    prom_url: "https://github.com/prometheus/prometheus/releases/download/v2.41.0/prometheus-2.41.0.linux-amd64.tar.gz"
+    node_exporter_url: "https://github.com/prometheus/node_exporter/releases/download/v1.8.2/node_exporter-1.8.2.linux-amd64.tar.gz"
+    grafana_version: "8.4.6"
+  tasks:
+    - name: Copy the setup script to the target machine
+      ansible.builtin.copy:
+        src: ./setup.sh
+        dest: /tmp/setup.sh
+        mode: '0755'
+
+    - name: Run the setup script
+      ansible.builtin.shell: |
+        GO_VERSION="{{ go_version }}" CELESTIA_NODENAME="{{ celestia_node_name }}" /tmp/setup.sh
+      environment:
+        HOME: "{{ ansible_env.HOME }}"
+
+    - name: Copy the wallet setup script to the target machine
+      ansible.builtin.copy:
+        src: ./wallet.sh
+        dest: /tmp/wallet.sh
+        mode: '0755'
+
+    - name: Run the wallet setup script with password input
+      ansible.builtin.expect:
+        command: /tmp/wallet.sh
+        responses:
+          "Enter keyring passphrase::": "{{ wallet_password }}\n"
+          "Re-enter keyring passphrase:": "{{ wallet_password }}\n"
+          "Enter keyring passphrase:": "{{ wallet_password }}\n"
+      register: wallet_setup_result
+      no_log: true
+
+    - name: Copy the monitoring setup script to the target machine
+      ansible.builtin.copy:
+        src: ./pg.sh
+        dest: /tmp/pg.sh
+        mode: '0755'
+
+    - name: Run the monitoring setup script with environment variables
+      ansible.builtin.shell: |
+        PROM_URL="{{ prom_url }}" NODE_EXPORTER_URL="{{ node_exporter_url }}" GRAFANA_VERSION="{{ grafana_version }}" /tmp/pg.sh
+      environment:
+        HOME: "{{ ansible_env.HOME }}"
