@@ -1,0 +1,185 @@
+Environment setup
+sudo apt update && sudo apt upgrade -y
+
+sudo apt install curl tar wget aria2 clang pkg-config libssl-dev jq build-essential git make ncdu -y
+
+Go
+ver="1.23.0" (take from the user)
+cd $HOME
+wget "https://golang.org/dl/go$ver.linux-amd64.tar.gz"
+sudo rm -rf /usr/local/go
+sudo tar -C /usr/local -xzf "go$ver.linux-amd64.tar.gz"
+rm "go$ver.linux-amd64.tar.gz"
+echo "export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin" >> $HOME/.bash_profile
+source $HOME/.bash_profile
+go version
+
+Celestia-appd binary
+echo "y" | bash -c "$(curl -sL https://docs.celestia.org/celestia-app.sh)"
+celestia-appd version
+
+Setting variables
+CELESTIA_NODENAME="MY_NODE"
+CELESTIA_WALLET="MY_WALLET"
+CELESTIA_CHAIN="mocha-4”
+
+
+Set up the P2P networks
+
+celestia-appd init $CELESTIA_NODENAME --chain-id $CELESTIA_CHAIN
+celestia-appd download-genesis mocha-4
+SEEDS=$(curl -sL https://raw.githubusercontent.com/celestiaorg/networks/master/mocha-4/seeds.txt | tr '\n' ',')
+echo $SEEDS
+sed -i.bak -e "s/^seeds *=.*/seeds = \"$SEEDS\"/" $HOME/.celestia-app/config/config.toml
+
+
+Enable BBR
+sudo sh -c 'echo -e "\nnet.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf && sysctl -p'
+Start the celestia-app with SystemD
+sudo tee <<EOF >/dev/null /etc/systemd/system/celestia-appd.service
+[Unit]
+Description=celestia-appd Cosmos daemon
+After=network-online.target
+
+[Service]
+User=$USER
+ExecStart=$(which celestia-appd) start
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+PROMETHEUS-ENABLE
+sed -i 's/^prometheus *=.*/prometheus = true/' $HOME/.celestia-app/config/config.toml
+sed -i 's/^namespace *=.*/namespace = "celestia"/' $HOME/.celestia-app/config/config.toml
+
+
+sudo systemctl enable celestia-appd
+sudo systemctl start celestia-appd
+sudo systemctl status celestia-appd
+
+Check sync status
+curl -s localhost:26657/status | jq .result | jq .sync_info
+
+
+Manual way of wallet creation and generating the secrets 
+
+source .bash_profile
+wallet="wallet"
+echo "export CELESTIA_WALLET=$wallet" >> $HOME/.bash_profile
+
+source .bash_profile
+celestia-appd keys add $CELESTIA_WALLET --keyring-backend os
+
+CELESTIA_ADDRESS=$(celestia-appd keys show $CELESTIA_WALLET -a --keyring-backend os)
+CELESTIA_VALOPER=$(celestia-appd keys show $CELESTIA_WALLET --bech val -a --keyring-backend os)
+echo 'export CELESTIA_ADDRESS='${CELESTIA_ADDRESS} >> $HOME/.bash_profile
+echo 'export CELESTIA_VALOPER='${CELESTIA_VALOPER} >> $HOME/.bash_profile
+
+celestia-appd query bank balances $CELESTIA_ADDRESS
+
+
+Prometheus and Promtool
+sudo useradd -m -s /bin/bash Prometheus 
+sudo groupadd --system Prometheus  
+sudo usermod -aG Prometheus Prometheus  
+
+sudo mkdir /var/lib/prometheus
+for i in rules rules.d files_sd; do sudo mkdir -p /etc/prometheus/${i}; done
+mkdir -p /tmp/prometheus && cd /tmp/prometheus
+curl -s https://api.github.com/repos/prometheus/prometheus/releases/latest | \ grep browser_download_url | grep linux-amd64 | cut -d '"' -f 4 | \ xargs wget -q
+
+tar xvf prometheus*.tar.gz
+cd prometheus*/
+sudo mv prometheus promtool /usr/local/bin/
+
+sudo mv prometheus.yml /etc/prometheus/prometheus.yml
+sudo mv consoles/ console_libraries/ /etc/prometheus/
+
+
+sudo tee /etc/systemd/system/prometheus.service<<EOF
+[Unit]
+Description=Prometheus
+Documentation=https://prometheus.io/docs/introduction/overview/
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=Prometheus
+Group=Prometheus
+ExecReload=/bin/kill -HUP \$MAINPID
+ExecStart=/usr/local/bin/prometheus \
+--config.file=/etc/prometheus/prometheus.yml \
+--storage.tsdb.path=/var/lib/prometheus \
+--web.console.templates=/etc/prometheus/consoles \
+--web.console.libraries=/etc/prometheus/console_libraries \
+--web.listen-address=0.0.0.0:9090 \
+--web.external-url=
+
+SyslogIdentifier=prometheus
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+
+for i in rules rules.d files_sd; do sudo chown -R prometheus:prometheus /etc/prometheus/${i}; done
+for i in rules rules.d files_sd; do sudo chmod -R 775 /etc/prometheus/${i}; done
+sudo chown -R Prometheus:Prometheus /var/lib/prometheus/
+
+Daemon
+
+sudo systemctl daemon-reload
+sudo systemctl enable prometheus
+sudo systemctl start prometheus
+NODE_EXPORTER
+wget https://github.com/prometheus/node_exporter/releases/download/v1.8.2/node_exporter-1.8.2.linux-amd64.tar.gz
+tar xvfz node_exporter-*.*-amd64.tar.gz
+cd node_exporter-*.*-amd64
+sudo mv node_exporter /usr/local/bin/
+
+sudo tee /etc/systemd/system/node_exporter.service<<EOF
+[Unit]
+Description=Prometheus Node Exporter
+After=network.target
+
+[Service]
+User=prometheus
+Group=prometheus
+ExecStart=/usr/local/bin/node_exporter
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo useradd --no-create-home --shell /bin/false prometheus
+sudo chown prometheus:prometheus /usr/local/bin/node_exporter
+sudo systemctl daemon-reload
+sudo systemctl start node_exporter
+sudo systemctl enable node_exporter
+Target set
+sudo sed -i '/^scrape_configs:/a \ \ - job_name: "celestia_metrics"\n    static_configs:\n      - targets: ["localhost:26660"]' /etc/prometheus/prometheus.yml
+
+sudo sed -i '/^scrape_configs:/a \ \ - job_name: "instance_metrics"\n    static_configs:\n      - targets: ["localhost:9100"]' /etc/prometheus/prometheus.yml
+
+
+GRAFANA
+
+sudo apt-get install -y apt-transport-https software-properties-common wget
+sudo mkdir -p /etc/apt/keyrings/
+wget -q -O - https://apt.grafana.com/gpg.key | gpg --dearmor | sudo tee /etc/apt/keyrings/grafana.gpg > /dev/null
+echo "deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main" | sudo tee -a /etc/apt/sources.list.d/grafana.list
+sudo apt-get update
+sudo apt-get install grafana -y
+
+sudo systemctl enable grafana-server
+sudo systemctl start grafana-server
+sudo systemctl status grafana-server
+
